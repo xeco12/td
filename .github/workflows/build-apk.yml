@@ -1,0 +1,155 @@
+name: Build TDLib + APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "APK türü"
+        required: true
+        default: "debug"
+        type: choice
+        options:
+          - debug
+          - release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      # ── 1. Android projesini klonla ──────────────────────────────────────
+      - name: Android projesini klonla
+        uses: actions/checkout@v4
+        with:
+          path: android-project
+
+      # ── 2. TDLib kaynak kodunu klonla ────────────────────────────────────
+      - name: TDLib kaynak kodunu klonla
+        uses: actions/checkout@v4
+        with:
+          repository: tdlib/td
+          ref: master
+          path: td
+
+      # ── 3. Sistem araçlarını kur ─────────────────────────────────────────
+      - name: Sistem araçlarını kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            php-cli \
+            perl \
+            gperf \
+            unzip \
+            wget \
+            git \
+            zlib1g-dev
+
+      # ── 4. Java 17 kur ───────────────────────────────────────────────────
+      - name: Java 17 kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      # ── 5. TDLib native kütüphanelerini derle ────────────────────────────
+      - name: TDLib - ortamı kontrol et
+        working-directory: td/example/android
+        run: |
+          chmod +x *.sh
+          ./check-environment.sh || true
+
+      - name: TDLib - Android SDK indir
+        working-directory: td/example/android
+        run: ./fetch-sdk.sh
+
+      - name: TDLib - OpenSSL derle
+        working-directory: td/example/android
+        run: ./build-openssl.sh
+
+      - name: TDLib - TDLib derle
+        working-directory: td/example/android
+        run: ./build-tdlib.sh
+
+      # ── 6. Native .so dosyalarını Android projesine kopyala ──────────────
+      - name: Native kütüphaneleri projeye kopyala
+        run: |
+          JNILIBS="android-project/app/src/main/jniLibs"
+          mkdir -p "$JNILIBS/arm64-v8a"
+          mkdir -p "$JNILIBS/armeabi-v7a"
+          mkdir -p "$JNILIBS/x86"
+          mkdir -p "$JNILIBS/x86_64"
+
+          LIBS_DIR="td/example/android/tdlib/libs"
+
+          cp "$LIBS_DIR/arm64-v8a/libtdjni.so"    "$JNILIBS/arm64-v8a/"  || true
+          cp "$LIBS_DIR/armeabi-v7a/libtdjni.so"  "$JNILIBS/armeabi-v7a/" || true
+          cp "$LIBS_DIR/x86/libtdjni.so"           "$JNILIBS/x86/"         || true
+          cp "$LIBS_DIR/x86_64/libtdjni.so"        "$JNILIBS/x86_64/"      || true
+
+          echo "Kopyalanan dosyalar:"
+          find "$JNILIBS" -name "*.so"
+
+      # ── 7. TDLib Java/JNI arayüz kodlarını kopyala ──────────────────────
+      - name: TDLib Java kodlarını projeye kopyala
+        run: |
+          JAVA_SRC="android-project/app/src/main/java"
+          TDLIB_JAVA="td/example/android/tdlib/java"
+
+          if [ -d "$TDLIB_JAVA" ]; then
+            cp -r "$TDLIB_JAVA/." "$JAVA_SRC/"
+            echo "Java kodları kopyalandı:"
+            find "$JAVA_SRC" -name "*.java" | head -20
+          else
+            echo "UYARI: TDLib Java klasörü bulunamadı: $TDLIB_JAVA"
+            find td/example/android/tdlib -type d
+          fi
+
+      # ── 8. API ID/Hash'i Gradle'a aktar ─────────────────────────────────
+      - name: local.properties oluştur
+        working-directory: android-project
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          echo "TELEGRAM_API_ID=${TELEGRAM_API_ID}" >> local.properties
+          echo "TELEGRAM_API_HASH=${TELEGRAM_API_HASH}" >> local.properties
+          echo "sdk.dir=$ANDROID_SDK_ROOT" >> local.properties
+
+      # ── 9. Gradle izinlerini ver ─────────────────────────────────────────
+      - name: Gradle izinleri ver
+        working-directory: android-project
+        run: chmod +x gradlew
+
+      # ── 10. Debug APK derle ──────────────────────────────────────────────
+      - name: Debug APK derle
+        if: ${{ github.event.inputs.build_type == 'debug' }}
+        working-directory: android-project
+        run: ./gradlew assembleDebug --stacktrace
+
+      # ── 11. Release APK derle (imzasız) ─────────────────────────────────
+      - name: Release APK derle (imzasız)
+        if: ${{ github.event.inputs.build_type == 'release' }}
+        working-directory: android-project
+        run: ./gradlew assembleRelease --stacktrace
+
+      # ── 12. APK'yı artifact olarak yükle ────────────────────────────────
+      - name: APK'yı artifact olarak yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-client-apk-${{ github.event.inputs.build_type }}
+          path: |
+            android-project/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # ── 13. Özet ─────────────────────────────────────────────────────────
+      - name: Derleme özeti
+        run: |
+          echo "## Derleme Tamamlandı ✅" >> $GITHUB_STEP_SUMMARY
+          echo "**APK türü:** ${{ github.event.inputs.build_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Artifact:** telegram-client-apk-${{ github.event.inputs.build_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### APK Dosyaları:" >> $GITHUB_STEP_SUMMARY
+          find android-project/app/build/outputs/apk -name "*.apk" >> $GITHUB_STEP_SUMMARY || true
